@@ -264,12 +264,21 @@ def verify_sample_consistency(model_dfs: List[pd.DataFrame], selected_indices: L
 
     return True
 
-def _calculate_balance_cost(is_correct_matrix: np.ndarray, selected_indices: List[int], w_accuracy_std: float, w_all_correct: float, w_all_incorrect: float) -> float:
+def _calculate_balance_cost(
+    is_correct_matrix: np.ndarray,
+    selected_indices: List[int],
+    w_accuracy_std: float,
+    w_all_correct: float,
+    w_all_incorrect: float,
+    all_difficulties: np.ndarray = None,
+    w_diff_balance: float = 0.0
+) -> float:
     """
     计算平衡性成本：
     - 各模型正确率的标准差
     - 所有模型全对样本比例
     - 所有模型全错样本比例
+    - 各Difficulty组内正确率的标准差（可选）
     """
     if not selected_indices:
         return float('inf')
@@ -282,21 +291,34 @@ def _calculate_balance_cost(is_correct_matrix: np.ndarray, selected_indices: Lis
     all_correct = np.all(sub_matrix, axis=0).sum() / Np
     all_incorrect = np.all(~sub_matrix, axis=0).sum() / Np
     cost = w_accuracy_std * acc_std + w_all_correct * all_correct + w_all_incorrect * all_incorrect
+    # 新增：各Difficulty组内正确率std
+    if w_diff_balance > 0 and all_difficulties is not None:
+        diff_rates = []
+        selected_difficulties = all_difficulties[selected_indices]
+        for d in set(selected_difficulties):
+            idxs = [i for i, idx in enumerate(selected_indices) if all_difficulties[idx] == d]
+            if not idxs:
+                continue
+            sub_d = sub_matrix[:, idxs]  # (M, Nd)
+            diff_rates.append(sub_d.sum() / sub_d.size)
+        if diff_rates:
+            cost += w_diff_balance * np.std(diff_rates)
     return cost
+
 
 def filter_for_balanced_samples(
     is_correct_matrix: np.ndarray,
     candidate_indices: List[int],
     N_prime: int,
-
     all_difficulties: np.ndarray,
     balance_difficulty: bool = False,
     w_accuracy_std: float = 1.0,
     w_all_correct: float = 1.0,
-    w_all_incorrect: float = 1.0
+    w_all_incorrect: float = 1.0,
+    w_diff_balance: float = 0.0
 ) -> List[int]:
     """
-    从候选样本中筛选N'个平衡性更好的子集，支持难度平衡
+    从候选样本中筛选N'个平衡性更好的子集，支持难度平衡和组内正确率平衡
     """
     best_indices = []
     remaining = set(candidate_indices)
@@ -315,17 +337,18 @@ def filter_for_balanced_samples(
         if balance_difficulty:
             # 计算每个难度还缺多少
             needed = {d: target_counts[d] - current_counts[d] for d in target_counts}
-            # 只考虑还没补满的
             lacking = [d for d, v in needed.items() if v > 0]
             if lacking:
-                # 选最缺的
                 max_d = max(lacking, key=lambda d: needed[d])
                 candidate_pool = [idx for idx in remaining if all_difficulties[idx] == max_d]
             else:
                 candidate_pool = list(remaining)
         for idx in candidate_pool:
             trial = best_indices + [idx]
-            cost = _calculate_balance_cost(is_correct_matrix, trial, w_accuracy_std, w_all_correct, w_all_incorrect)
+            cost = _calculate_balance_cost(
+                is_correct_matrix, trial, w_accuracy_std, w_all_correct, w_all_incorrect,
+                all_difficulties=all_difficulties, w_diff_balance=w_diff_balance
+            )
             if cost < best_cost:
                 best_cost = cost
                 best_idx = idx
@@ -343,7 +366,7 @@ def filter_for_balanced_samples(
 def find_diverse_samples(
     file_paths: List[str], N: int, lambda_param: float = 0.1,
     label_filter: Optional[int] = None, balance_difficulty: bool = False,
-    N_prime: Optional[int] = None, w_accuracy_std: float = 1.0, w_all_correct: float = 1.0, w_all_incorrect: float = 1.0
+    N_prime: Optional[int] = None, w_accuracy_std: float = 1.0, w_all_correct: float = 1.0, w_all_incorrect: float = 1.0, w_diff_balance: float = 0.0
 ) -> Tuple[List[int], np.ndarray, pd.DataFrame]:
     """
     主函数：运行差异样本选择算法 (使用 Numba 和 tqdm)
@@ -403,7 +426,8 @@ def find_diverse_samples(
             balance_difficulty,
             w_accuracy_std,
             w_all_correct,
-            w_all_incorrect
+            w_all_incorrect,
+            w_diff_balance
         )
         selected_indices = balanced_indices
         print(f"\n经过平衡性筛选后，最终选定的样本索引: {selected_indices}")
@@ -450,15 +474,16 @@ if __name__ == "__main__":
         '/home/zyz/Codes/SpatialCognition/Results/x2_result/dpt_dept_x2_swin_base_patch4_window7_224_20250504-1556/best_eval_model_test/none/softmax_test.csv' 
     ]  # 模型输出文件列表
     
-    N = 60  # 要选择的样本数
+    N = 90  # 要选择的样本数
     lambda_param = 1e-4  # 平衡参数
-    label_filter = 1  # 可选：只选择标签为 0 的样本，设为None表示选择所有标签
+    label_filter = 0  # 可选：设为None表示选择所有标签
     balance_difficulty = True  # 开启难度平衡
     # 新增平衡性筛选参数
     N_prime = 30  # 最终平衡样本数
     w_accuracy_std = 1.0
-    w_all_correct = 2.0
-    w_all_incorrect = 2.0
+    w_all_correct = 0.5
+    w_all_incorrect = 0.5
+    w_diff_balance = 3.0  # 新增参数：组内正确率平衡权重
     
     # 定义输出文件名
     output_path = 'ImagePairsFromPano/5classes_dataset/diverse_sample_csv'
@@ -470,7 +495,7 @@ if __name__ == "__main__":
     try:
         selected_indices, final_matrix, selected_samples_df = find_diverse_samples( # 接收 DataFrame
             file_paths, N, lambda_param, label_filter, balance_difficulty,
-            N_prime, w_accuracy_std, w_all_correct, w_all_incorrect
+            N_prime, w_accuracy_std, w_all_correct, w_all_incorrect, w_diff_balance
         )
         
         print(f"\n选定的样本索引: {selected_indices}")
