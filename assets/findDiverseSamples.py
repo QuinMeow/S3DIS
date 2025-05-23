@@ -1,551 +1,581 @@
 import numpy as np
 import pandas as pd
 from typing import List, Tuple, Optional, Dict, Set
-from collections import Counter
-import numba # 导入 numba
-from tqdm import tqdm # 导入 tqdm
+from collections import Counter, defaultdict
+import numba
+from tqdm import tqdm
+import os
 
-def load_model_outputs(file_paths: List[str]) -> List[pd.DataFrame]:
-    """加载多个模型的softmax输出文件"""
-    model_outputs = []
-    for path in file_paths:
-        df = pd.read_csv(path)
-        model_outputs.append(df)
-    return model_outputs
-
-# 使用 Numba 加速矩阵构建
+# 将Numba函数定义在类外部
 @numba.jit(nopython=True)
 def build_matrix_numba(all_softmax_data: np.ndarray, sample_indices: np.ndarray) -> np.ndarray:
-    """
-    为选定的样本构建模型预测矩阵 (Numba 加速版)
-    参数:
-    - all_softmax_data: 形状为 (M, total_samples, 4) 的 NumPy 数组，包含所有模型的softmax值
-    - sample_indices: 包含所选样本索引的 NumPy 数组
-    """
+    """构建模型预测矩阵 (Numba加速)"""
     M, _, _ = all_softmax_data.shape
     N = len(sample_indices)
     
-    # 初始化矩阵 (M x 4N)
-    matrix = np.zeros((M, 4*N), dtype=np.float64) # 指定 dtype
+    matrix = np.zeros((M, 4*N), dtype=np.float64)
     
-    for i in range(M): # 遍历模型
-        for j in range(N): # 遍历选中的样本索引
+    for i in range(M):
+        for j in range(N):
             idx = sample_indices[j]
-            # 从预处理数据中提取 softmax 值
-            softmax_values = all_softmax_data[i, idx, :]
-            # 放入矩阵
+            softmax_values = all_softmax_data[i, idx, :4]  # 只取前4个类别
             matrix[i, j*4:(j+1)*4] = softmax_values
             
     return matrix
 
-def filter_samples_by_criteria(model_df: pd.DataFrame, label_filter: Optional[int] = None) -> List[int]:
-    """根据标签筛选样本"""
-    if label_filter is not None:
-        return model_df[model_df['label'] == label_filter].index.tolist()
-    return list(range(len(model_df)))
-
-def select_diverse_samples(
-    all_softmax_data: np.ndarray, 
-    all_difficulties: np.ndarray, 
-    initial_indices: List[int], 
-    N: int, 
-    lambda_param: float = 0.1, 
-    balance_difficulty: bool = False
-) -> List[int]:
-    """
-    选择在模型间预测差异最大的N个样本 (使用 Numba 和 tqdm)
+class SampleSelector:
+    """重构后的样本选择器"""
     
-    参数:
-    - all_softmax_data: 形状为 (M, total_samples, 4) 的 NumPy 数组
-    - all_difficulties: 形状为 (total_samples,) 的 NumPy 数组 (0: Easy, 1: Normal, 2: Hard, -1: Unknown)
-    - initial_indices: 经过标签过滤后的初始样本索引列表
-    - N: 要选择的样本数量
-    - lambda_param: 平衡参数
-    - balance_difficulty: 是否平衡不同难度等级的样本
-    """
-    
-    if len(initial_indices) < N:
-        raise ValueError(f"可用样本数量({len(initial_indices)})小于请求数量({N})")
-    
-    # 初始化
-    selected_indices_list = []
-    remaining_indices_set = set(initial_indices) # 使用集合以提高移除效率
-    
-    # 如果需要平衡难度等级
-    if balance_difficulty:
-        # 排除Unknown难度 (-1)
-        valid_mask = all_difficulties[initial_indices] != -1
-        valid_initial_indices = np.array(initial_indices)[valid_mask]
-        remaining_indices_set = set(valid_initial_indices)
+    def __init__(self, lambda_param: float = 0.1):
+        self.lambda_param = lambda_param
+        self.difficulty_map_encode = {'Easy': 0, 'Normal': 1, 'Hard': 2, 'Unknown': -1}
+        self.selected_samples = set()  # 用于唯一性约束
         
-        if len(remaining_indices_set) < N:
-             raise ValueError(f"排除Unknown难度后，可用样本数量({len(remaining_indices_set)})小于请求数量({N})")
-
-        # 计算每个难度级别的目标数量
-        target_counts = {0: N//3, 1: N//3, 2: N - 2*(N//3)} # 0: Easy, 1: Normal, 2: Hard
-        current_counts = {0: 0, 1: 0, 2: 0}
+    def load_and_merge_model_data(self, model_paths: List[List[str]]) -> List[pd.DataFrame]:
+        """
+        加载并合并每个模型下不同数据增强方法的CSV
         
-        # 预先按难度分组索引，提高查找效率
-        difficulty_map = {0: [], 1: [], 2: []}
-        for idx in remaining_indices_set:
-            difficulty_code = all_difficulties[idx]
-            if difficulty_code != -1:
-                 difficulty_map[difficulty_code].append(idx)
-        
-        # 使用 tqdm 添加进度条
-        pbar = tqdm(range(N), desc="Selecting diverse samples (balanced)")
-        for _ in pbar:
-            best_gain = float("-inf")
-            best_idx = -1 # 使用-1表示未找到
+        Args:
+            model_paths: 二维列表，第一维是模型，第二维是该模型下不同增强方法的CSV路径
             
-            # 确定当前最需要增加的难度级别
-            candidate_indices_pool = []
-            if len(selected_indices_list) < N - 3: # 留出最后几个样本用于微调平衡
-                # 计算各难度与目标的差距比例
-                needed_ratios = {}
-                total_selected = max(1, len(selected_indices_list)) # 避免除以零
-                for d_code in target_counts:
-                    target_ratio = target_counts[d_code] / N
-                    current_ratio = current_counts[d_code] / total_selected if total_selected > 0 else 0
-                    needed_ratios[d_code] = target_ratio - current_ratio
-                
-                # 按需求度排序
-                preferred_difficulties = sorted(needed_ratios, key=needed_ratios.get, reverse=True)
-                
-                # 按优先级构建候选池
-                for d_code in preferred_difficulties:
-                    # 只考虑仍在 remaining_indices_set 中的样本
-                    potential_candidates = [idx for idx in difficulty_map[d_code] if idx in remaining_indices_set]
-                    if potential_candidates:
-                        candidate_indices_pool = potential_candidates
-                        break # 找到一个非空候选集就跳出
-                
-                if not candidate_indices_pool: # 如果按优先级没找到，则考虑所有剩余样本
-                    candidate_indices_pool = list(remaining_indices_set)
-
-            else: # 最后几个样本，优先补足未达标的难度
-                missing_counts = {d_code: max(0, target_counts[d_code] - current_counts[d_code]) for d_code in target_counts}
-                if sum(missing_counts.values()) > 0:
-                    # 按缺失数量排序
-                    missing_difficulties = sorted(missing_counts, key=missing_counts.get, reverse=True)
-                    for d_code in missing_difficulties:
-                        if missing_counts[d_code] > 0:
-                            potential_candidates = [idx for idx in difficulty_map[d_code] if idx in remaining_indices_set]
-                            if potential_candidates:
-                                candidate_indices_pool = potential_candidates
-                                break
-                    if not candidate_indices_pool:
-                         candidate_indices_pool = list(remaining_indices_set)
-                else: # 所有难度都达标或超标，则考虑所有剩余样本
-                    candidate_indices_pool = list(remaining_indices_set)
-
-            # 从候选样本中选择最优的
-            current_selection_np = np.array(selected_indices_list, dtype=np.int64) # Numba 需要 NumPy 数组
-            for idx in candidate_indices_pool:
-                # 尝试添加样本
-                S_try_np = np.append(current_selection_np, idx)
-                
-                # 使用 Numba 加速的 build_matrix
-                A_try = build_matrix_numba(all_softmax_data, S_try_np)
-                
-                # 计算奇异值
-                try:
-                    s = np.linalg.svd(A_try, compute_uv=False)  # 奇异值降序排列
-                    # if len(s) < len(S_try_np): # 检查奇异值数量是否足够
-                        # print(f"Warning: Rank deficiency detected for sample set size {len(S_try_np)}. Skipping index {idx}.")
-                        # continue # 跳过可能导致问题的样本
-                    sigma_min = s[-1]
-                    sigma_max = s[0]
-                    
-                    # 防止除以零或非常小的值
-                    if sigma_min < 1e-10: 
-                        J = -float('inf') # 惩罚数值不稳定的情况
-                    else:
-                        # 目标函数
-                        J = sigma_min - lambda_param * (sigma_max / sigma_min - 1)
-
-                    if J > best_gain:
-                        best_gain = J
-                        best_idx = idx
-                except np.linalg.LinAlgError:
-                    print(f"Warning: SVD computation failed for index {idx}. Skipping.")
-                    continue # SVD计算失败则跳过
-
-            if best_idx != -1:
-                selected_indices_list.append(best_idx)
-                remaining_indices_set.remove(best_idx)
-                # 更新当前各难度级别的计数
-                difficulty_code = all_difficulties[best_idx]
-                current_counts[difficulty_code] += 1
-                # 更新进度条显示信息
-                pbar.set_postfix(difficulty_counts=current_counts)
-            else:
-                print("\nWarning: Could not find a suitable sample to add. Stopping early.")
-                break # 无法找到更好的样本
-        pbar.close()
-
-    else: # 原始贪心选择逻辑(不考虑难度平衡)
-        # 使用 tqdm 添加进度条
-        pbar = tqdm(range(N), desc="Selecting diverse samples")
-        for _ in pbar:
-            best_gain = float("-inf")
-            best_idx = -1
-
-            current_selection_np = np.array(selected_indices_list, dtype=np.int64)
-            # 将 set 转换为 list 进行迭代
-            candidate_indices_pool = list(remaining_indices_set) 
+        Returns:
+            每个模型合并后的DataFrame列表
+        """
+        merged_models = []
+        
+        for model_idx, augmentation_paths in enumerate(model_paths):
+            model_dfs = []
             
-            for idx in candidate_indices_pool:
-                S_try_np = np.append(current_selection_np, idx)
-                A_try = build_matrix_numba(all_softmax_data, S_try_np)
-                
+            for aug_path in augmentation_paths:
                 try:
-                    s = np.linalg.svd(A_try, compute_uv=False)
-                    if len(s) < len(S_try_np):
-                        continue
-                    sigma_min = s[-1]
-                    sigma_max = s[0]
-
-                    if sigma_min < 1e-10:
-                        J = -float('inf')
-                    else:
-                        J = sigma_min - lambda_param * (sigma_max / sigma_min - 1)
-                    
-                    if J > best_gain:
-                        best_gain = J
-                        best_idx = idx
-                except np.linalg.LinAlgError:
+                    df = pd.read_csv(aug_path)
+                    # 从路径中提取增强方法名
+                    aug_method = self._extract_augmentation_method(aug_path)
+                    df['augmentation_method'] = aug_method
+                    df['model_id'] = model_idx
+                    model_dfs.append(df)
+                except Exception as e:
+                    print(f"警告: 加载文件 {aug_path} 失败: {e}")
                     continue
-
-            if best_idx != -1:
-                selected_indices_list.append(best_idx)
-                remaining_indices_set.remove(best_idx)
+            
+            if model_dfs:
+                # 合并同一模型下的所有增强方法数据
+                merged_model_df = pd.concat(model_dfs, ignore_index=True)
+                merged_models.append(merged_model_df)
             else:
-                print("\nWarning: Could not find a suitable sample to add. Stopping early.")
-                break
-        pbar.close()
-    
-    # 统计所选样本的难度分布
-    if balance_difficulty:
-        final_difficulties = [all_difficulties[idx] for idx in selected_indices_list]
-        # 将数字代码映射回字符串
-        difficulty_map_rev = {0: 'Easy', 1: 'Normal', 2: 'Hard'}
-        difficulty_distribution = Counter([difficulty_map_rev[d] for d in final_difficulties])
-        print(f"最终难度分布: {dict(difficulty_distribution)}")
-    
-    return selected_indices_list
-
-def verify_sample_consistency(model_dfs: List[pd.DataFrame], selected_indices: List[int]) -> bool:
-    """验证选定的样本在所有模型中对应相同的数据点"""
-    if not selected_indices: # 如果没有选出样本，则无需验证
-        return True
+                print(f"警告: 模型 {model_idx} 没有成功加载任何数据")
         
-    id_cols = ['camera_uuid', 'room', 'frame_num_a', 'frame_num_b']
+        return merged_models
     
-    # 使用第一个选定样本的第一个模型作为参考
-    reference_idx = selected_indices[0]
-    reference_values = model_dfs[0].iloc[reference_idx][id_cols].values
+    def _extract_augmentation_method(self, file_path: str) -> str:
+        """从文件路径中提取增强方法名"""
+        path_parts = file_path.split('/')
+        
+        # 查找包含增强方法的路径部分
+        for part in reversed(path_parts):
+            if part in ['none', 'edge_reduction', 'texture_reduction', 'gray']:
+                return part
     
-    for idx in selected_indices:
-        for df in model_dfs:
-            current_values = df.iloc[idx][id_cols].values
-            # 检查类型和值是否都相等
-            if not all(ref == cur for ref, cur in zip(reference_values, current_values)):
-                 print(f"Inconsistency found at index {idx}:")
-                 print(f"  Reference ({model_dfs[0].iloc[reference_idx]['camera_uuid']}): {reference_values}")
-                 print(f"  Current ({df.iloc[idx]['camera_uuid']}): {current_values}")
-                 return False
-            # 更新参考值为当前样本，以便后续比较基于同一行的不同模型
-            reference_values = current_values 
-        # 重置参考值为下一个样本的第一个模型
-        if selected_indices.index(idx) + 1 < len(selected_indices):
-             next_idx = selected_indices[selected_indices.index(idx) + 1]
-             reference_values = model_dfs[0].iloc[next_idx][id_cols].values
-
-    return True
-
-def _calculate_balance_cost(
-    is_correct_matrix: np.ndarray,
-    selected_indices: List[int],
-    w_accuracy_std: float,
-    w_all_correct: float,
-    w_all_incorrect: float,
-    all_difficulties: np.ndarray = None,
-    w_diff_balance: float = 0.0
-) -> float:
-    """
-    计算平衡性成本：
-    - 各模型正确率的标准差
-    - 所有模型全对样本比例
-    - 所有模型全错样本比例
-    - 各Difficulty组内正确率的标准差（可选）
-    """
-    if not selected_indices:
-        return float('inf')
-    sub_matrix = is_correct_matrix[:, selected_indices]  # (M, N')
-    M, Np = sub_matrix.shape
-    # 各模型正确率
-    accs = sub_matrix.sum(axis=1) / Np
-    acc_std = np.std(accs)
-    # 每个样本被所有模型全对/全错
-    all_correct = np.all(sub_matrix, axis=0).sum() / Np
-    all_incorrect = np.all(~sub_matrix, axis=0).sum() / Np
-    cost = w_accuracy_std * acc_std + w_all_correct * all_correct + w_all_incorrect * all_incorrect
-    # 新增：各Difficulty组内正确率std
-    if w_diff_balance > 0 and all_difficulties is not None:
-        diff_rates = []
-        selected_difficulties = all_difficulties[selected_indices]
-        for d in set(selected_difficulties):
-            idxs = [i for i, idx in enumerate(selected_indices) if all_difficulties[idx] == d]
-            if not idxs:
-                continue
-            sub_d = sub_matrix[:, idxs]  # (M, Nd)
-            diff_rates.append(sub_d.sum() / sub_d.size)
-        if diff_rates:
-            cost += w_diff_balance * np.std(diff_rates)
-    return cost
-
-
-def filter_for_balanced_samples(
-    is_correct_matrix: np.ndarray,
-    candidate_indices: List[int],
-    N_prime: int,
-    all_difficulties: np.ndarray,
-    balance_difficulty: bool = False,
-    w_accuracy_std: float = 1.0,
-    w_all_correct: float = 1.0,
-    w_all_incorrect: float = 1.0,
-    w_diff_balance: float = 0.0
-) -> List[int]:
-    """
-    从候选样本中筛选N'个平衡性更好的子集，支持难度平衡和组内正确率平衡
-    """
-    best_indices = []
-    remaining = set(candidate_indices)
-    if balance_difficulty:
-        # 统计候选池中各难度的样本
-        candidate_difficulties = {idx: all_difficulties[idx] for idx in candidate_indices}
-        valid_difficulties = [d for d in [0,1,2] if any(v==d for v in candidate_difficulties.values())]
-        target_counts = {d: N_prime // len(valid_difficulties) for d in valid_difficulties}
-        for i, d in enumerate(valid_difficulties[:N_prime % len(valid_difficulties)]):
-            target_counts[d] += 1
-        current_counts = {d: 0 for d in valid_difficulties}
-    for _ in range(N_prime):
-        best_cost = float('inf')
-        best_idx = None
-        candidate_pool = list(remaining)
-        if balance_difficulty:
-            # 计算每个难度还缺多少
-            needed = {d: target_counts[d] - current_counts[d] for d in target_counts}
-            lacking = [d for d, v in needed.items() if v > 0]
-            if lacking:
-                max_d = max(lacking, key=lambda d: needed[d])
-                candidate_pool = [idx for idx in remaining if all_difficulties[idx] == max_d]
-            else:
-                candidate_pool = list(remaining)
-        for idx in candidate_pool:
-            trial = best_indices + [idx]
-            cost = _calculate_balance_cost(
-                is_correct_matrix, trial, w_accuracy_std, w_all_correct, w_all_incorrect,
-                all_difficulties=all_difficulties, w_diff_balance=w_diff_balance
-            )
-            if cost < best_cost:
-                best_cost = cost
-                best_idx = idx
-        if best_idx is not None:
-            best_indices.append(best_idx)
-            remaining.remove(best_idx)
-            if balance_difficulty:
-                d = all_difficulties[best_idx]
-                if d in current_counts:
-                    current_counts[d] += 1
+        # 如果没找到，从文件名中提取
+        filename = os.path.basename(file_path)
+        if 'none' in filename:
+            return 'none'
+        elif 'gray' in filename:
+            return 'gray'
+        elif 'edge_reduction' in filename:
+            return 'edge_reduction'
+        elif 'texture_reduction' in filename:
+            return 'texture_reduction'
         else:
-            break
-    return best_indices
-
-def find_diverse_samples(
-    file_paths: List[str], N: int, lambda_param: float = 0.1,
-    label_filter: Optional[int] = None, balance_difficulty: bool = False,
-    N_prime: Optional[int] = None, w_accuracy_std: float = 1.0, w_all_correct: float = 1.0, w_all_incorrect: float = 1.0, w_diff_balance: float = 0.0
-) -> Tuple[List[int], np.ndarray, pd.DataFrame]:
-    """
-    主函数：运行差异样本选择算法 (使用 Numba 和 tqdm)
-    返回:
-    - selected_indices: 选定样本的索引列表
-    - final_matrix: 最终构建的 M x 4N 矩阵
-    - selected_samples_df: 包含所选样本详细信息的 DataFrame
-    """
-    # 加载模型输出
-    print("Loading model outputs...")
-    model_dfs = load_model_outputs(file_paths)
+            return 'unknown'
     
-    # --- 数据预处理 ---
-    print("Preprocessing data...")
-    M = len(model_dfs)
-    total_samples = len(model_dfs[0])
-    all_softmax_data = np.zeros((M, total_samples, 4), dtype=np.float64)
+    def _build_matrix_numba(self, all_softmax_data: np.ndarray, sample_indices: np.ndarray) -> np.ndarray:
+        """构建模型预测矩阵 (调用Numba加速函数)"""
+        return build_matrix_numba(all_softmax_data, sample_indices)
     
-    # 提取所有模型的 softmax 数据
-    for i, df in enumerate(model_dfs):
-        softmax_cols = [f'softmax_{k}' for k in range(4)]
-        all_softmax_data[i, :, :] = df[softmax_cols].values
+    def _prepare_data(self, model_dfs: List[pd.DataFrame], label_filter: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray, List[int], Dict]:
+        """预处理数据"""
+        # 使用第一个模型的数据作为基准来获取样本索引
+        base_df = model_dfs[0]
         
-    # 提取难度信息并编码 (只需从第一个 DataFrame 获取)
-    difficulty_map_encode = {'Easy': 0, 'Normal': 1, 'Hard': 2, 'Unknown': -1}
-    # 使用 .get 提供默认值 -1 处理可能的缺失或非标准难度标签
-    all_difficulties = np.array([difficulty_map_encode.get(d, -1) for d in model_dfs[0]['difficulty']], dtype=np.int64)
-
-    # 按标签过滤初始索引
-    initial_indices = filter_samples_by_criteria(model_dfs[0], label_filter)
-    print(f"Initial samples after label filtering ({label_filter=}): {len(initial_indices)}")
-
-    # --- 选择差异样本 ---
-    selected_indices = select_diverse_samples(
-        all_softmax_data, 
-        all_difficulties, 
-        initial_indices, 
-        N, 
-        lambda_param, 
-        balance_difficulty
-    )
-
-    # --- 平衡性筛选 ---
-    if label_filter is not None and N_prime is not None and N_prime < len(selected_indices):
-        # 构建 is_correct_matrix: (M, total_samples)
+        # 按标签过滤
+        if label_filter is not None:
+            initial_indices = base_df[base_df['label'] == label_filter].index.tolist()
+        else:
+            initial_indices = list(range(len(base_df)))
+        
+        print(f"标签过滤后的初始样本数: {len(initial_indices)}")
+        
+        # 构建所有模型的softmax数据
         M = len(model_dfs)
-        total_samples = len(model_dfs[0])
-        # 每个模型对每个样本的预测类别
-        pred_labels = np.argmax(all_softmax_data, axis=2)  # (M, total_samples)
-        is_correct_matrix = (pred_labels == label_filter)  # (M, total_samples)
-        # 只对已选的N个样本做二次筛选
-        balanced_indices = filter_for_balanced_samples(
-            is_correct_matrix,
-            selected_indices,
-            N_prime,
-            all_difficulties,
-            balance_difficulty,
-            w_accuracy_std,
-            w_all_correct,
-            w_all_incorrect,
-            w_diff_balance
+        total_samples = len(base_df)
+        all_softmax_data = np.zeros((M, total_samples, 4), dtype=np.float64)
+        
+        for i, df in enumerate(model_dfs):
+            softmax_cols = [f'softmax_{k}' for k in range(4)]
+            all_softmax_data[i, :, :] = df[softmax_cols].values
+        
+        # 提取难度信息
+        all_difficulties = np.array([
+            self.difficulty_map_encode.get(d, -1) 
+            for d in base_df['difficulty']
+        ], dtype=np.int64)
+        
+        # 构建样本元信息字典
+        sample_info = {}
+        id_cols = ['camera_uuid', 'room', 'frame_num_a', 'frame_num_b']
+        for idx in initial_indices:
+            key = tuple(base_df.iloc[idx][id_cols].values)
+            sample_info[idx] = {
+                'key': key,
+                'label': base_df.iloc[idx]['label'],
+                'difficulty': base_df.iloc[idx]['difficulty'],
+                'augmentation_method': base_df.iloc[idx]['augmentation_method']
+            }
+        
+        return all_softmax_data, all_difficulties, initial_indices, sample_info
+    
+    def _check_all_constraints(self, 
+                              candidate_idx: int,
+                              current_selection: List[int],
+                              all_softmax_data: np.ndarray,
+                              all_difficulties: np.ndarray,
+                              sample_info: Dict,
+                              label_filter: Optional[int],
+                              target_difficulty_counts: Dict[int, int],
+                              current_difficulty_counts: Dict[int, int],
+                              target_augmentation_counts: Dict[str, int],
+                              current_augmentation_counts: Dict[str, int]) -> Tuple[bool, float]:
+        """
+        检查所有约束条件并返回是否满足以及目标函数值
+        
+        Returns:
+            (is_valid, objective_score)
+        """
+        # 1. 唯一性约束：检查是否已有相同的图像对
+        candidate_key = sample_info[candidate_idx]['key']
+        if candidate_key in self.selected_samples:
+            return False, -float('inf')
+        
+        # 2. Unknown结果约束：排除Unknown难度
+        if all_difficulties[candidate_idx] == -1:
+            return False, -float('inf')
+        
+        # 构建试验性选择
+        trial_selection = current_selection + [candidate_idx]
+        trial_selection_np = np.array(trial_selection, dtype=np.int64)
+        
+        # 3. 矩阵奇异值约束（结果差异约束）
+        try:
+            A_trial = self._build_matrix_numba(all_softmax_data, trial_selection_np)
+            singular_values = np.linalg.svd(A_trial, compute_uv=False)
+            
+            if singular_values[-1] < 1e-10:
+                return False, -float('inf')
+            
+            sigma_min = singular_values[-1]
+            sigma_max = singular_values[0]
+            diversity_score = sigma_min - self.lambda_param * (sigma_max / sigma_min - 1)
+            
+        except np.linalg.LinAlgError:
+            return False, -float('inf')
+        
+        # 4. 正确率约束和异常值约束
+        if label_filter is not None:
+            M = all_softmax_data.shape[0]
+            # 计算每个模型对试验选择的预测
+            pred_labels = np.argmax(all_softmax_data[:, trial_selection, :4], axis=2)
+            is_correct = (pred_labels == label_filter)
+            
+            # 检查是否有全对或全错的样本
+            all_correct_samples = np.all(is_correct, axis=0)
+            all_incorrect_samples = np.all(~is_correct, axis=0)
+            
+            if np.any(all_correct_samples) or np.any(all_incorrect_samples):
+                return False, -float('inf')
+                # 给予轻微惩罚而不是完全排除
+                # diversity_score -= 0.5
+            
+            # 计算各模型正确率的标准差
+            model_accuracies = np.mean(is_correct, axis=1)
+            accuracy_std = np.std(model_accuracies)
+            
+            # 正确率约束：标准差不应过大
+            if accuracy_std > 0.3:  # 可调节的阈值
+                diversity_score -= accuracy_std
+        
+        # 5. 增强方法平衡约束（提高优先级，更严格）
+        candidate_augmentation = sample_info[candidate_idx]['augmentation_method']
+        if candidate_augmentation in current_augmentation_counts:
+            aug_count = current_augmentation_counts[candidate_augmentation] + 1
+            target_aug_count = target_augmentation_counts.get(candidate_augmentation, 0)
+            
+            # 更严格的平衡约束
+            if aug_count > target_aug_count + 1:  # 只允许+1的偏差
+                diversity_score -= 2.0  # 增加惩罚力度
+            elif aug_count > target_aug_count:
+                diversity_score -= 0.5  # 轻微惩罚
+            else:
+                # 奖励不足的增强方法
+                diversity_score += 0.2
+        
+        # 6. 难度平衡约束（降低优先级）
+        candidate_difficulty = all_difficulties[candidate_idx]
+        if candidate_difficulty in current_difficulty_counts:
+            new_count = current_difficulty_counts[candidate_difficulty] + 1
+            target_count = target_difficulty_counts.get(candidate_difficulty, 0)
+            
+            # 如果超出目标太多，给予轻微惩罚
+            if new_count > target_count + 2:
+                diversity_score -= 1.0  # 降低惩罚力度
+        
+        return True, diversity_score
+    
+    def select_diverse_samples(self,
+                              model_paths: List[List[str]],
+                              N: int,
+                              label_filter: Optional[int] = None,
+                              balance_difficulty: bool = True,
+                              balance_augmentation: bool = True) -> Tuple[List[int], np.ndarray, pd.DataFrame]:
+        """
+        主要的样本选择函数，一次性实现所有约束
+        
+        Args:
+            model_paths: 二维列表，第一维是模型，第二维是该模型下不同增强方法的CSV路径
+            N: 要选择的样本数量
+            label_filter: 标签过滤器
+            balance_difficulty: 是否平衡难度
+            balance_augmentation: 是否平衡增强方法
+            
+        Returns:
+            (selected_indices, final_matrix, selected_samples_df)
+        """
+        print("加载并合并模型数据...")
+        model_dfs = self.load_and_merge_model_data(model_paths)
+        
+        if not model_dfs:
+            raise ValueError("没有成功加载任何模型数据")
+        
+        print("预处理数据...")
+        all_softmax_data, all_difficulties, initial_indices, sample_info = self._prepare_data(
+            model_dfs, label_filter
         )
-        selected_indices = balanced_indices
-        print(f"\n经过平衡性筛选后，最终选定的样本索引: {selected_indices}")
-
-    # --- 验证与收尾 ---
-    print("Verifying sample consistency...")
-    is_consistent = verify_sample_consistency(model_dfs, selected_indices)
-    if not is_consistent:
-        raise ValueError("所选样本在不同模型间不一致 (camera_uuid, room, frame_num_a, frame_num_b 必须匹配)")
-    
-    print("Building final matrix...")
-    # 构建最终矩阵 (使用 Numba 加速版)
-    final_matrix = build_matrix_numba(all_softmax_data, np.array(selected_indices, dtype=np.int64))
-    
-    # --- 收集并输出所选样本的信息 ---
-    selected_samples_info = []
-    print("\n所选样本的详细信息:")
-    if selected_indices:
-        info_cols = ['camera_uuid', 'room', 'frame_num_a', 'frame_num_b', 'label', 'difficulty']
-        for i, idx in enumerate(selected_indices):
-            # 从原始 DataFrame 获取信息以显示
-            sample_data = model_dfs[0].iloc[idx][info_cols].to_dict()
-            sample_data['original_index'] = idx # 添加原始索引
-            selected_samples_info.append(sample_data)
-            print(f"{i+1}. 索引 {idx}: {sample_data}")
         
-        # 创建 DataFrame
-        selected_samples_df = pd.DataFrame(selected_samples_info)
-        # 调整列顺序，将 original_index 放在前面
-        cols_order = ['original_index'] + info_cols
-        selected_samples_df = selected_samples_df[cols_order]
-
-    else:
-        print("未能选出任何样本。")
-        selected_samples_df = pd.DataFrame() # 返回空 DataFrame
-
-    return selected_indices, final_matrix, selected_samples_df # 返回 DataFrame
-
-if __name__ == "__main__":
-    # 示例用法
-    file_paths = [
-        '/home/zyz/Codes/SpatialCognition/Results/x2_result/rcf_x2_swin_base_patch4_window7_224_20250424-2140/best_eval_model_test/none/softmax_test.csv',
-        '/home/zyz/Codes/SpatialCognition/Results/x2_result/deepten_x2_swin_base_patch4_window7_224_20250504-1116/best_eval_model_test/none/softmax_test.csv',
-        '/home/zyz/Codes/SpatialCognition/Results/x2_result/dpt_dept_x2_swin_base_patch4_window7_224_20250504-1556/best_eval_model_test/none/softmax_test.csv' 
-    ]  # 模型输出文件列表
-    
-    N = 90  # 要选择的样本数
-    lambda_param = 1e-4  # 平衡参数
-    label_filter = 0  # 可选：设为None表示选择所有标签
-    balance_difficulty = True  # 开启难度平衡
-    # 新增平衡性筛选参数
-    N_prime = 30  # 最终平衡样本数
-    w_accuracy_std = 1.0
-    w_all_correct = 0.5
-    w_all_incorrect = 0.5
-    w_diff_balance = 3.0  # 新增参数：组内正确率平衡权重
-    
-    # 定义输出文件名
-    output_path = 'ImagePairsFromPano/5classes_dataset/diverse_sample_csv'
-    output_sample_info_csv = f'{output_path}/samples_{label_filter}.csv'
-    output_matrix_csv = f'{output_path}/matrix_{label_filter}.csv'
-    # output_sample_info_csv = '/data2/zyz/S3DIS/ImagePairsFromPano/5classes_dataset/selected_samples_info.csv'
-    # output_matrix_csv = '/data2/zyz/S3DIS/ImagePairsFromPano/5classes_dataset/final_result_matrix.csv'
-
-    try:
-        selected_indices, final_matrix, selected_samples_df = find_diverse_samples( # 接收 DataFrame
-            file_paths, N, lambda_param, label_filter, balance_difficulty,
-            N_prime, w_accuracy_std, w_all_correct, w_all_incorrect, w_diff_balance
-        )
+        # 排除任一模型预测为类别4的样本
+        pred_labels_all = np.argmax(all_softmax_data, axis=2)
+        valid_mask = np.all(pred_labels_all[:, initial_indices] != 4, axis=0)
+        initial_indices = [initial_indices[i] for i, v in enumerate(valid_mask) if v]
+        print(f"排除预测为类别4的样本后，剩余: {len(initial_indices)}")
         
-        print(f"\n选定的样本索引: {selected_indices}")
-        print(f"最终矩阵形状: {final_matrix.shape}")  # 应为 (M, 4N)
+        if len(initial_indices) < N:
+            raise ValueError(f"可用样本数量({len(initial_indices)})小于请求数量({N})")
         
-        # 计算最终矩阵的奇异值
-        if final_matrix.size > 0: # 确保矩阵非空
-             singular_values = np.linalg.svd(final_matrix, compute_uv=False)
-             print(f"奇异值: {singular_values}")
-             if singular_values[-1] > 1e-10: # 避免除以零
-                 print(f"条件数: {singular_values[0] / singular_values[-1]}")
-             else:
-                 print("条件数: Inf (最小奇异值接近零)")
+        # 设置难度平衡目标
+        if balance_difficulty:
+            valid_difficulties = [0, 1, 2]  # Easy, Normal, Hard
+            target_difficulty_counts = {d: N // 3 for d in valid_difficulties}
+            # 处理除不尽的情况
+            for i in range(N % 3):
+                target_difficulty_counts[valid_difficulties[i]] += 1
         else:
-             print("最终矩阵为空，无法计算奇异值。")
+            target_difficulty_counts = {}
+        
+        # 设置增强方法平衡目标
+        if balance_augmentation:
+            # 统计所有可用的增强方法
+            available_augmentations = set()
+            for idx in initial_indices:
+                aug_method = sample_info[idx]['augmentation_method']
+                available_augmentations.add(aug_method)
+            
+            available_augmentations = sorted(list(available_augmentations))
+            num_augmentations = len(available_augmentations)
+            
+            target_augmentation_counts = {aug: N // num_augmentations for aug in available_augmentations}
+            # 处理除不尽的情况
+            for i in range(N % num_augmentations):
+                target_augmentation_counts[available_augmentations[i]] += 1
+                
+            print(f"增强方法平衡目标: {target_augmentation_counts}")
+        else:
+            target_augmentation_counts = {}
+            available_augmentations = []
+        
+        current_difficulty_counts = {0: 0, 1: 0, 2: 0}
+        current_augmentation_counts = {aug: 0 for aug in available_augmentations}
+        selected_indices = []
+        remaining_indices = set(initial_indices)
+        self.selected_samples = set()  # 重置已选样本集合
+        
+        print(f"开始选择 {N} 个多样化样本...")
+        pbar = tqdm(range(N), desc="选择样本")
+        
+        for iteration in pbar:
+            best_score = -float('inf')
+            best_idx = None
+            
+            # 构建候选池：优先选择不足的类别
+            candidate_pool = list(remaining_indices)
+            
+            # 更积极的平衡策略
+            if balance_augmentation and iteration < N - 2:  # 几乎到最后才放松约束
+                # 找出最需要的增强方法（严格按照不足数量排序）
+                augmentation_needs = []
+                for aug in available_augmentations:
+                    current_count = current_augmentation_counts[aug]
+                    target_count = target_augmentation_counts[aug]
+                    need_level = target_count - current_count
+                    if need_level > 0:
+                        augmentation_needs.append((aug, need_level))
+                
+                # 按需求程度排序
+                augmentation_needs.sort(key=lambda x: x[1], reverse=True)
+                
+                if augmentation_needs:
+                    # 优先选择最需要的增强方法
+                    most_needed_augs = [aug for aug, _ in augmentation_needs[:2]]  # 选择最需要的2种
+                    
+                    preferred_candidates = []
+                    for idx in remaining_indices:
+                        idx_augmentation = sample_info[idx]['augmentation_method']
+                        if idx_augmentation in most_needed_augs:
+                            preferred_candidates.append(idx)
+                    
+                    if preferred_candidates:
+                        candidate_pool = preferred_candidates
+                        print(f"\n第{iteration+1}轮: 优先选择增强方法 {most_needed_augs}")
+            
+            # 在候选池中寻找最佳样本
+            for candidate_idx in candidate_pool:
+                is_valid, score = self._check_all_constraints(
+                    candidate_idx, selected_indices, all_softmax_data,
+                    all_difficulties, sample_info, label_filter,
+                    target_difficulty_counts, current_difficulty_counts,
+                    target_augmentation_counts, current_augmentation_counts
+                )
+                
+                if is_valid and score > best_score:
+                    best_score = score
+                    best_idx = candidate_idx
+            
+            if best_idx is not None:
+                # 添加最佳样本
+                selected_indices.append(best_idx)
+                remaining_indices.remove(best_idx)
+                self.selected_samples.add(sample_info[best_idx]['key'])
+                
+                # 更新难度计数
+                difficulty = all_difficulties[best_idx]
+                if difficulty in current_difficulty_counts:
+                    current_difficulty_counts[difficulty] += 1
+                
+                # 更新增强方法计数
+                augmentation = sample_info[best_idx]['augmentation_method']
+                if augmentation in current_augmentation_counts:
+                    current_augmentation_counts[augmentation] += 1
+                
+                # 更新进度条信息
+                pbar.set_postfix(
+                    score=f"{best_score:.4f}",
+                    difficulty=current_difficulty_counts,
+                    augmentation=dict(current_augmentation_counts)
+                )
+            else:
+                print(f"\n警告: 第 {iteration+1} 轮无法找到满足约束的样本，提前停止")
+                break
+        
+        pbar.close()
+        
+        # 验证样本一致性
+        print("验证样本一致性...")
+        if not self._verify_sample_consistency(model_dfs, selected_indices):
+            print("警告: 样本一致性验证失败")
+        
+        # 构建最终矩阵
+        print("构建最终矩阵...")
+        final_matrix = self._build_matrix_numba(
+            all_softmax_data, np.array(selected_indices, dtype=np.int64)
+        )
+        
+        # 收集选中样本信息
+        selected_samples_df = self._collect_sample_info(model_dfs[0], selected_indices)
+        
+        # 输出统计信息
+        self._print_statistics(selected_indices, all_difficulties, final_matrix, sample_info)
+        
+        return selected_indices, final_matrix, selected_samples_df
+    
+    def _verify_sample_consistency(self, model_dfs: List[pd.DataFrame], selected_indices: List[int]) -> bool:
+        """验证选定样本在所有模型中的一致性"""
+        if not selected_indices:
+            return True
+        
+        id_cols = ['camera_uuid', 'room', 'frame_num_a', 'frame_num_b']
+        
+        for idx in selected_indices:
+            reference_values = model_dfs[0].iloc[idx][id_cols].values
+            for df in model_dfs[1:]:
+                current_values = df.iloc[idx][id_cols].values
+                if not all(ref == cur for ref, cur in zip(reference_values, current_values)):
+                    print(f"不一致的样本索引: {idx}")
+                    return False
+        
+        return True
+    
+    def _collect_sample_info(self, base_df: pd.DataFrame, selected_indices: List[int]) -> pd.DataFrame:
+        """收集选中样本的详细信息"""
+        if not selected_indices:
+            return pd.DataFrame()
+        
+        info_cols = ['camera_uuid', 'room', 'frame_num_a', 'frame_num_b', 'label', 'difficulty', 'augmentation_method']
+        selected_samples_info = []
+        
+        for i, idx in enumerate(selected_indices):
+            sample_data = base_df.iloc[idx][info_cols].to_dict()
+            sample_data['original_index'] = idx
+            sample_data['selection_order'] = i + 1
+            selected_samples_info.append(sample_data)
+        
+        df = pd.DataFrame(selected_samples_info)
+        
+        # 添加方向标签
+        direction_map = {0: 'Up', 1: 'Down', 2: 'Left', 3: 'Right', 4: 'Unknown'}
+        df['b2a_direction'] = df['label'].map(direction_map)
+        
+        # 调整列顺序
+        cols_order = ['selection_order', 'original_index', 'camera_uuid', 'room', 
+                     'frame_num_a', 'frame_num_b', 'b2a_direction', 'difficulty', 'augmentation_method']
+        df = df[cols_order]
+        
+        return df
+    
+    def _print_statistics(self, selected_indices: List[int], all_difficulties: np.ndarray, final_matrix: np.ndarray, sample_info: Dict):
+        """打印统计信息"""
+        print(f"\n成功选择了 {len(selected_indices)} 个样本")
+        
+        # 难度分布统计
+        if selected_indices:
+            selected_difficulties = [all_difficulties[idx] for idx in selected_indices]
+            difficulty_map_rev = {0: 'Easy', 1: 'Normal', 2: 'Hard'}
+            difficulty_distribution = Counter([
+                difficulty_map_rev[d] for d in selected_difficulties if d != -1
+            ])
+            print(f"难度分布: {dict(difficulty_distribution)}")
+            
+            # 增强方法分布统计
+            selected_augmentations = [sample_info[idx]['augmentation_method'] for idx in selected_indices]
+            augmentation_distribution = Counter(selected_augmentations)
+            print(f"增强方法分布: {dict(augmentation_distribution)}")
+        
+        # 矩阵统计
+        if final_matrix.size > 0:
+            singular_values = np.linalg.svd(final_matrix, compute_uv=False)
+            print(f"最终矩阵形状: {final_matrix.shape}")
+            print(f"条件数: {singular_values[0] / singular_values[-1]:.2f}")
+            print(f"最小奇异值: {singular_values[-1]:.6f}")
 
-        # --- 保存结果到 CSV ---
+
+def main():
+    """主函数示例"""
+    # 定义模型路径：二维列表，第一维是模型，第二维是该模型下不同增强方法的CSV
+    model_paths = [
+        # RCF模型下的不同增强方法
+        [
+           "/home/zyz/Codes/SpatialCognition/Results/diverse_result/rcf_x2/different_methods/best_eval_model_test/rgb/none/softmax_rgb_none.csv",
+           "/home/zyz/Codes/SpatialCognition/Results/diverse_result/rcf_x2/different_methods/best_eval_model_test/rgb/edge_reduction/softmax_rgb_edge_reduction.csv",
+           "/home/zyz/Codes/SpatialCognition/Results/diverse_result/rcf_x2/different_methods/best_eval_model_test/rgb/texture_reduction/softmax_rgb_texture_reduction.csv",
+           "/home/zyz/Codes/SpatialCognition/Results/diverse_result/rcf_x2/different_methods/best_eval_model_test/rgb/gray/softmax_rgb_gray.csv",
+        ],
+        # DeepTen模型下的不同增强方法
+        [
+            "/home/zyz/Codes/SpatialCognition/Results/diverse_result/deepten_x2/different_methods/best_eval_model_test/rgb/none/softmax_rgb_none.csv",
+            "/home/zyz/Codes/SpatialCognition/Results/diverse_result/deepten_x2/different_methods/best_eval_model_test/rgb/edge_reduction/softmax_rgb_edge_reduction.csv",
+            "/home/zyz/Codes/SpatialCognition/Results/diverse_result/deepten_x2/different_methods/best_eval_model_test/rgb/texture_reduction/softmax_rgb_texture_reduction.csv",
+            "/home/zyz/Codes/SpatialCognition/Results/diverse_result/deepten_x2/different_methods/best_eval_model_test/rgb/gray/softmax_rgb_gray.csv",
+        ], 
+        # FC4 模型下的不同增强方法
+        [
+            "/home/zyz/Codes/SpatialCognition/Results/diverse_result/fc4_x2/different_methods/best_eval_model_test/rgb/none/softmax_rgb_none.csv",
+            "/home/zyz/Codes/SpatialCognition/Results/diverse_result/fc4_x2/different_methods/best_eval_model_test/rgb/edge_reduction/softmax_rgb_edge_reduction.csv",
+            "/home/zyz/Codes/SpatialCognition/Results/diverse_result/fc4_x2/different_methods/best_eval_model_test/rgb/texture_reduction/softmax_rgb_texture_reduction.csv",
+            "/home/zyz/Codes/SpatialCognition/Results/diverse_result/fc4_x2/different_methods/best_eval_model_test/rgb/gray/softmax_rgb_gray.csv",
+        ],
+        # DPT模型下的不同增强方法
+        [
+            "/home/zyz/Codes/SpatialCognition/Results/diverse_result/dpt_x2/different_methods/best_eval_model_test/rgb/none/softmax_rgb_none.csv",
+            "/home/zyz/Codes/SpatialCognition/Results/diverse_result/dpt_x2/different_methods/best_eval_model_test/rgb/edge_reduction/softmax_rgb_edge_reduction.csv",
+            "/home/zyz/Codes/SpatialCognition/Results/diverse_result/dpt_x2/different_methods/best_eval_model_test/rgb/texture_reduction/softmax_rgb_texture_reduction.csv",
+            "/home/zyz/Codes/SpatialCognition/Results/diverse_result/dpt_x2/different_methods/best_eval_model_test/rgb/gray/softmax_rgb_gray.csv",
+        ]
+    ]
+    
+    # 参数设置
+    N = 30  # 要选择的样本数
+    lambda_param = 1e-4  # 平衡参数
+    label_filter = 0  # 标签过滤器
+    balance_difficulty = True  # 是否平衡难度
+    balance_augmentation = True  # 是否平衡增强方法
+    
+    # 输出路径设置
+    output_path = 'ImagePairsFromPano/5classes_dataset/diverse_sample'
+    os.makedirs(output_path, exist_ok=True)
+    
+    try:
+        # 创建样本选择器并运行
+        selector = SampleSelector(lambda_param=lambda_param)
+        selected_indices, final_matrix, selected_samples_df = selector.select_diverse_samples(
+            model_paths, N, label_filter, balance_difficulty, balance_augmentation
+        )
+        
+        # 保存结果
         if not selected_samples_df.empty:
-            # 将label列替换为b2a_direction列，并将数字转为字符串
-            direction_map_rev = {0: 'Up', 1: 'Down', 2: 'Left', 3: 'Right', 4: 'Unknown'}
-            # 新增b2a_direction列
-            selected_samples_df['b2a_direction'] = selected_samples_df['label'].map(direction_map_rev)
-            # 调整列顺序，去掉label列
-            cols_order = ['original_index', 'camera_uuid', 'room', 'frame_num_a', 'frame_num_b', 'b2a_direction', 'difficulty']
-            selected_samples_df = selected_samples_df[cols_order]
-            print(f"\nSaving selected sample info to {output_sample_info_csv}...")
-            selected_samples_df.to_csv(output_sample_info_csv, index=False)
-            print("Done.")
+            sample_info_csv = f'{output_path}/samples_{label_filter}.csv'
+            selected_samples_df.to_csv(sample_info_csv, index=False)
+            print(f"样本信息已保存到: {sample_info_csv}")
         
         if final_matrix.size > 0:
-             print(f"Saving final result matrix to {output_matrix_csv}...")
-             # 将 NumPy 矩阵转换为 DataFrame 以便保存带标题的 CSV
-             matrix_df = pd.DataFrame(final_matrix)
-             # 列名按最终样本数生成
-             matrix_cols = []
-             for i in range(final_matrix.shape[0]):
-                 for j in range(final_matrix.shape[1] // (4 * final_matrix.shape[0])):
-                     for k in range(4):
-                         matrix_cols.append(f'model_{i}_sample_{j}_softmax_{k}')
-             if len(matrix_cols) == final_matrix.shape[1]:
-                 matrix_df.columns = matrix_cols
-             else:
-                 print(f"Warning: Column name count ({len(matrix_cols)}) does not match matrix columns ({final_matrix.shape[1]}). Saving without header.")
-
-             matrix_df.to_csv(output_matrix_csv, index=False) # 保存矩阵
-             print("Done.")
-        else:
-             print("Final matrix is empty, skipping saving.")
-
-    except ValueError as e:
-        print(f"\nError: {e}")
+            matrix_csv = f'{output_path}/matrix_{label_filter}.csv'
+            matrix_df = pd.DataFrame(final_matrix)
+            
+            # 生成列名
+            matrix_cols = []
+            for j in range(final_matrix.shape[1] // 4):
+                for k in range(4):
+                    matrix_cols.append(f'sample_{j}_softmax_{k}')
+            
+            if len(matrix_cols) == final_matrix.shape[1]:
+                matrix_df.columns = matrix_cols
+            
+            matrix_df.to_csv(matrix_csv, index=False)
+            print(f"结果矩阵已保存到: {matrix_csv}")
+            
+            # 保存特定标签的概率矩阵
+            if label_filter is not None:
+                prob_matrix_csv = f'{output_path}/matrix_{label_filter}_prob.csv'
+                # 这里需要重新加载数据来构建概率矩阵
+                model_dfs = selector.load_and_merge_model_data(model_paths)
+                M = len(model_dfs)
+                N_samples = len(selected_indices)
+                prob_matrix = np.zeros((N_samples, M), dtype=np.float64)
+                
+                for m in range(M):
+                    df = model_dfs[m]
+                    for n, idx in enumerate(selected_indices):
+                        prob_matrix[n, m] = df.loc[idx, f'softmax_{label_filter}']
+                
+                prob_df = pd.DataFrame(prob_matrix)
+                prob_df.columns = [f'model_{i}' for i in range(M)]
+                prob_df.index = [f'sample_{i}' for i in range(N_samples)]
+                prob_df.to_csv(prob_matrix_csv)
+                print(f"概率矩阵已保存到: {prob_matrix_csv}")
+        
+        print("\n样本选择完成！")
+        
     except Exception as e:
-        print(f"\nAn unexpected error occurred: {e}")
+        print(f"错误: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+if __name__ == "__main__":
+    main()
