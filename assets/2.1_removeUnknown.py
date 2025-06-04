@@ -1,6 +1,6 @@
-#!/usr/bin/env python3
-# 移除CSV文件中b2a_direction类别为Unknown的记录
-
+'''
+移除CSV文件中b2a_direction类别为Unknown的记录
+'''
 import pandas as pd
 import argparse
 import os

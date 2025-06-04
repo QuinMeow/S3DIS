@@ -1,3 +1,6 @@
+'''
+使用简单线条方式对语义分割区域进行填充
+'''
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt

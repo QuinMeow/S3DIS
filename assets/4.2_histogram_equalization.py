@@ -1,3 +1,6 @@
+'''
+对深度图做直方图均衡化
+'''
 import cv2
 import numpy as np
 import sys

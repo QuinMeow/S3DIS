@@ -1,3 +1,6 @@
+'''
+从S3DIS原有的RGB图像中，提取样本对
+'''
 import os
 import json
 import shutil

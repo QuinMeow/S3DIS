@@ -1,3 +1,6 @@
+'''
+测试全景图生成
+'''
 import cv2
 import py360convert
 

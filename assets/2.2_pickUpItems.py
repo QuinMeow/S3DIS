@@ -1,3 +1,6 @@
+'''
+从样本中随机抽取100条数据
+'''
 import pandas as pd
 
 # 读取原始CSV文件

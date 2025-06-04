@@ -1,3 +1,6 @@
+'''
+寻找使模型间差异化最大的样本
+'''
 import numpy as np
 import pandas as pd
 from typing import List, Tuple, Optional, Dict, Set

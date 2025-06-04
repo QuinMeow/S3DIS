@@ -1,3 +1,6 @@
+'''
+尝试用AI对不同语义分割区域进行风格迁移（未完成）
+'''
 import base64
 from openai import OpenAI
 import io

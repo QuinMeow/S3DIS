@@ -1,3 +1,6 @@
+'''
+根据csv中的图像信息，构建其他全景图类型（深度、语义）的图像对
+'''
 import os
 import cv2
 import py360convert

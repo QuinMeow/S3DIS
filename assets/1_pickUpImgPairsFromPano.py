@@ -1,3 +1,6 @@
+'''
+从S3DIS的全景图中，构建样本图像对
+'''
 import os
 import cv2
 import py360convert

@@ -1,3 +1,6 @@
+'''
+从多个文件夹的语义分割图中提取边界线并保存为新图像
+'''
 import cv2
 import numpy as np
 import os
