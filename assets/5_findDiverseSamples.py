@@ -26,8 +26,11 @@ def build_matrix_numba(all_softmax_data: np.ndarray, sample_indices: np.ndarray)
 class SampleSelector:
     """重构后的样本选择器"""
     
-    def __init__(self, lambda_param: float = 0.1):
+    def __init__(self, lambda_param: float = 0.1, strict_accuracy: bool = True, 
+                 accuracy_tolerance: float = 0.15):
         self.lambda_param = lambda_param
+        self.strict_accuracy = strict_accuracy
+        self.accuracy_tolerance = accuracy_tolerance  # 可调节的容忍度
         self.difficulty_map_encode = {'Easy': 0, 'Normal': 1, 'Hard': 2, 'Unknown': -1}
         self.selected_samples = set()  # 用于唯一性约束
         
@@ -180,10 +183,9 @@ class SampleSelector:
         except np.linalg.LinAlgError:
             return False, -float('inf')
         
-        # 4. 正确率约束和异常值约束
+        # 4. 动态调整的正确率约束
         if label_filter is not None:
             M = all_softmax_data.shape[0]
-            # 计算每个模型对试验选择的预测
             pred_labels = np.argmax(all_softmax_data[:, trial_selection, :4], axis=2)
             is_correct = (pred_labels == label_filter)
             
@@ -193,16 +195,54 @@ class SampleSelector:
             
             if np.any(all_correct_samples) or np.any(all_incorrect_samples):
                 return False, -float('inf')
-                # 给予轻微惩罚而不是完全排除
-                # diversity_score -= 0.5
             
-            # 计算各模型正确率的标准差
+            # 计算各模型的正确率
             model_accuracies = np.mean(is_correct, axis=1)
-            accuracy_std = np.std(model_accuracies)
             
-            # 正确率约束：标准差不应过大
-            if accuracy_std > 0.3:  # 可调节的阈值
-                diversity_score -= accuracy_std
+            # 根据当前样本数量动态调整约束严格程度
+            num_samples = len(trial_selection)
+            
+            if self.strict_accuracy:
+                # 动态调整容忍度：样本数量越少，容忍度越大
+                if num_samples <= 3:
+                    # 初期阶段：非常宽松
+                    dynamic_tolerance = 0.6  # 80%的容忍度
+                elif num_samples <= 6:
+                    # 早期阶段：较宽松
+                    dynamic_tolerance = 0.3  # 50%的容忍度
+                elif num_samples <= 10:
+                    # 中期阶段：逐渐严格
+                    dynamic_tolerance = 0.2  # 30%的容忍度
+                else:
+                    # 后期阶段：严格约束
+                    dynamic_tolerance = self.accuracy_tolerance  # 使用设定值
+                
+                # 计算约束指标
+                accuracy_std = np.std(model_accuracies)
+                accuracy_range = np.max(model_accuracies) - np.min(model_accuracies)
+                mean_accuracy = np.mean(model_accuracies)
+                max_deviation = np.max(np.abs(model_accuracies - mean_accuracy))
+                
+                # 应用动态约束
+                if (accuracy_std > dynamic_tolerance or 
+                    accuracy_range > dynamic_tolerance * 2 or 
+                    max_deviation > dynamic_tolerance * 1.5):
+                    
+                    # 如果是初期阶段，给予惩罚而不是直接拒绝
+                    if num_samples <= 5:
+                        diversity_score -= accuracy_std * 2  # 惩罚但不拒绝
+                    else:
+                        return False, -float('inf')  # 后期直接拒绝
+                
+                # 奖励好的平衡（使用动态容忍度）
+                if dynamic_tolerance > 0:
+                    balance_score = 1.0 - accuracy_std / dynamic_tolerance
+                    diversity_score += balance_score * 0.5  # 降低奖励权重
+            else:
+                # 宽松模式：仅惩罚
+                accuracy_std = np.std(model_accuracies)
+                if accuracy_std > self.accuracy_tolerance:
+                    diversity_score -= accuracy_std * 4
         
         # 5. 增强方法平衡约束（提高优先级，更严格）
         candidate_augmentation = sample_info[candidate_idx]['augmentation_method']
@@ -476,7 +516,7 @@ class SampleSelector:
 
 
 def main():
-    """主函数示例"""
+
     # 定义模型路径：二维列表，第一维是模型，第二维是该模型下不同增强方法的CSV
     model_paths = [
         # RCF模型下的不同增强方法
@@ -508,16 +548,23 @@ def main():
             "/home/zyz/Codes/SpatialCognition/Results/diverse_result/dpt_x2/different_methods/best_eval_model_test/rgb/gray/softmax_rgb_gray.csv",
         ]
     ]
-    
+
     # 参数设置
-    N = 30  # 要选择的样本数
-    lambda_param = 1e-4  # 平衡参数
-    label_filter = 0  # 标签过滤器
-    balance_difficulty = True  # 是否平衡难度
-    balance_augmentation = True  # 是否平衡增强方法
+    N = 30
+    lambda_param = 1e-4
+    label_filter = 3
+    balance_difficulty = True
+    balance_augmentation = True
+    
+    # 创建更严格的样本选择器
+    selector = SampleSelector(
+        lambda_param=lambda_param,
+        strict_accuracy=True,  # 启用严格模式
+        accuracy_tolerance=0.1  # 更严格的容忍度
+    )
     
     # 输出路径设置
-    output_path = 'ImagePairsFromPano/5classes_dataset/diverse_sample'
+    output_path = 'ImagePairsFromPano/5classes_dataset/diverse_sample_Enhance'
     os.makedirs(output_path, exist_ok=True)
     
     try:
