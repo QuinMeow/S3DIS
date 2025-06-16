@@ -1,5 +1,5 @@
 '''
-合并多个不同类别的样本到同一个csv文件中
+合并不同模型、不同类别的样本到同一个csv文件中, 并附上各模型的预测结果和统计信息
 '''
 import pandas as pd
 import numpy as np
@@ -411,12 +411,12 @@ if __name__ == "__main__":
         
         # 示例配置
         sample_files = [
-            "/data2/zyz/S3DIS/ImagePairsFromPano/5classes_dataset/diverse_sample_Enhance/samples_0.csv",
-            "/data2/zyz/S3DIS/ImagePairsFromPano/5classes_dataset/diverse_sample_Enhance/samples_1.csv",
-            "/data2/zyz/S3DIS/ImagePairsFromPano/5classes_dataset/diverse_sample_Enhance/samples_2.csv",
-            "/data2/zyz/S3DIS/ImagePairsFromPano/5classes_dataset/diverse_sample_Enhance/samples_3.csv"
+            "/data2/zyz/S3DIS/ImagePairsFromPano/5classes_dataset/diverse_sample_Enhance_>3/samples_0.csv",
+            "/data2/zyz/S3DIS/ImagePairsFromPano/5classes_dataset/diverse_sample_Enhance_>3/samples_1.csv",
+            "/data2/zyz/S3DIS/ImagePairsFromPano/5classes_dataset/diverse_sample_Enhance_>3/samples_2.csv",
+            "/data2/zyz/S3DIS/ImagePairsFromPano/5classes_dataset/diverse_sample_Enhance_>3/samples_3.csv"
         ]
-        output_file = "ImagePairsFromPano/5classes_dataset/diverse_sample_Enhance/combined_sample_results.csv"
+        output_file = "ImagePairsFromPano/5classes_dataset/diverse_sample_Enhance_>3/combined_sample_results.csv"
         
         model_paths = [
             # RCF模型下的不同增强方法

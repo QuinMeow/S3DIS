@@ -1,11 +1,11 @@
 '''
-移除CSV文件中b2a_direction类别为Unknown的记录
+移除CSV文件中b2a_direction类别为Unknown与角度差小于5度的记录
 '''
 import pandas as pd
 import argparse
 import os
 
-def remove_unknown_direction(input_file, output_file=None):
+def remove_unknown_direction(input_file, output_file=None, diff_bias=5):
     """
     移除CSV文件中b2a_direction为Unknown的行
     
@@ -49,11 +49,20 @@ def remove_unknown_direction(input_file, output_file=None):
     
     # 过滤掉b2a_direction为Unknown的行
     filtered_df = df[df['b2a_direction'] != 'Unknown']
-    
+
+    # 进一步移除yaw_diff和pitch_diff小于5的样本
+    if 'yaw_diff' in filtered_df.columns and 'pitch_diff' in filtered_df.columns:
+        before_angle_filter = len(filtered_df)
+        filtered_df = filtered_df[(filtered_df['yaw_diff'].abs() > diff_bias) | (filtered_df['pitch_diff'].abs() > diff_bias)]
+        after_angle_filter = len(filtered_df)
+        print(f"已移除 {before_angle_filter - after_angle_filter} 行 (yaw_diff或pitch_diff < {diff_bias})")
+    else:
+        print("警告: CSV文件中缺少'yaw_diff'或'pitch_diff'列，未进行角度过滤")
+
     # 输出过滤后的数据信息
     filtered_rows = len(filtered_df)
     removed_rows = total_rows - filtered_rows
-    print(f"已移除 {removed_rows} 行 (b2a_direction = 'Unknown')")
+    print(f"已移除 {removed_rows} 行 (b2a_direction = 'Unknown' 或 yaw_diff/pitch_diff < {diff_bias})")
     print(f"过滤后数据行数: {filtered_rows}")
     
     # 保存过滤后的数据
@@ -68,13 +77,13 @@ def remove_unknown_direction(input_file, output_file=None):
     return output_file
 
 def main():
-    parser = argparse.ArgumentParser(description='移除CSV文件中b2a_direction为Unknown的行')
-    parser.add_argument('input_file', type=str, help='输入CSV文件路径')
-    parser.add_argument('-o', '--output', type=str, default=None, help='输出CSV文件路径')
-    args = parser.parse_args()
     
+    input_path = "ImagePairsFromPano/5classes_dataset/test.csv"
+    diff_bias = 3
+    output_path = f"ImagePairsFromPano/5classes_dataset/test_No_Unkown_and_<{diff_bias}.csv"
+
     try:
-        output_file = remove_unknown_direction(args.input_file, args.output)
+        output_file = remove_unknown_direction(input_path, output_path, diff_bias)
         print(f"处理完成: {output_file}")
     except Exception as e:
         print(f"错误: {e}")

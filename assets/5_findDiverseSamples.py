@@ -30,12 +30,27 @@ class SampleSelector:
     """重构后的样本选择器"""
     
     def __init__(self, lambda_param: float = 0.1, strict_accuracy: bool = True, 
-                 accuracy_tolerance: float = 0.15):
+                 accuracy_tolerance: float = 0.15, additional_csv_path: Optional[str] = None):
         self.lambda_param = lambda_param
         self.strict_accuracy = strict_accuracy
         self.accuracy_tolerance = accuracy_tolerance  # 可调节的容忍度
         self.difficulty_map_encode = {'Easy': 0, 'Normal': 1, 'Hard': 2, 'Unknown': -1}
         self.selected_samples = set()  # 用于唯一性约束
+        self.additional_csv_path = additional_csv_path
+        self.additional_info_dict = None
+        self.additional_info_fields = []
+        if additional_csv_path is not None and os.path.exists(additional_csv_path):
+            add_df = pd.read_csv(additional_csv_path)
+            # 统一主键顺序
+            key_cols = ['camera_uuid', 'room', 'frame_num_a', 'frame_num_b']
+            # 兼容不同顺序
+            if not all(col in add_df.columns for col in key_cols):
+                key_cols = ['room', 'camera_uuid', 'frame_num_a', 'frame_num_b']
+            self.additional_info_fields = [c for c in add_df.columns if c not in key_cols]
+            self.additional_info_dict = {}
+            for _, row in add_df.iterrows():
+                key = (str(row['camera_uuid']), str(row['room']), int(row['frame_num_a']), int(row['frame_num_b']))
+                self.additional_info_dict[key] = row.to_dict()
         
     def load_and_merge_model_data(self, model_paths: List[List[str]]) -> List[pd.DataFrame]:
         """
@@ -103,14 +118,24 @@ class SampleSelector:
         """预处理数据"""
         # 使用第一个模型的数据作为基准来获取样本索引
         base_df = model_dfs[0]
-        
+        id_cols = ['camera_uuid', 'room', 'frame_num_a', 'frame_num_b']
         # 按标签过滤
         if label_filter is not None:
             initial_indices = base_df[base_df['label'] == label_filter].index.tolist()
         else:
             initial_indices = list(range(len(base_df)))
-        
-        print(f"标签过滤后的初始样本数: {len(initial_indices)}")
+        # 如果有额外csv，进一步过滤
+        if self.additional_info_dict is not None:
+            filtered_indices = []
+            for idx in initial_indices:
+                row = base_df.iloc[idx]
+                key = (str(row['camera_uuid']), str(row['room']), int(row['frame_num_a']), int(row['frame_num_b']))
+                if key in self.additional_info_dict:
+                    filtered_indices.append(idx)
+            initial_indices = filtered_indices
+            print(f"额外csv过滤后样本数: {len(initial_indices)}")
+        else:
+            print(f"标签过滤后的初始样本数: {len(initial_indices)}")
         
         # 构建所有模型的softmax数据
         M = len(model_dfs)
@@ -129,15 +154,20 @@ class SampleSelector:
         
         # 构建样本元信息字典
         sample_info = {}
-        id_cols = ['camera_uuid', 'room', 'frame_num_a', 'frame_num_b']
         for idx in initial_indices:
-            key = tuple(base_df.iloc[idx][id_cols].values)
-            sample_info[idx] = {
+            row = base_df.iloc[idx]
+            key = (str(row['camera_uuid']), str(row['room']), int(row['frame_num_a']), int(row['frame_num_b']))
+            info = {
                 'key': key,
-                'label': base_df.iloc[idx]['label'],
-                'difficulty': base_df.iloc[idx]['difficulty'],
-                'augmentation_method': base_df.iloc[idx]['augmentation_method']
+                'label': row['label'],
+                'difficulty': row['difficulty'],
+                'augmentation_method': row['augmentation_method']
             }
+            # 合并额外字段
+            if self.additional_info_dict is not None and key in self.additional_info_dict:
+                for f in self.additional_info_fields:
+                    info[f] = self.additional_info_dict[key][f]
+            sample_info[idx] = info
         
         return all_softmax_data, all_difficulties, initial_indices, sample_info
     
@@ -153,40 +183,33 @@ class SampleSelector:
                               target_augmentation_counts: Dict[str, int],
                               current_augmentation_counts: Dict[str, int]) -> Tuple[bool, float]:
         """
-        检查所有约束条件并返回是否满足以及目标函数值
-        
+        检查所有约束条件并返回是否满足、目标函数值和不满足原因
         Returns:
-            (is_valid, objective_score)
+            (is_valid, objective_score, reason)
         """
         # 1. 唯一性约束：检查是否已有相同的图像对
         candidate_key = sample_info[candidate_idx]['key']
         if candidate_key in self.selected_samples:
-            return False, -float('inf')
-        
-        # 2. Unknown结果约束：排除Unknown难度
+            return False, -float('inf'), "duplicate_key"
+        # 2. Unknown难度
         if all_difficulties[candidate_idx] == -1:
-            return False, -float('inf')
-        
-        # 构建试验性选择
-        trial_selection = current_selection + [candidate_idx]
-        trial_selection_np = np.array(trial_selection, dtype=np.int64)
-        
-        # 3. 矩阵奇异值约束（结果差异约束）
+            return False, -float('inf'), "unknown_difficulty"
+        # 3. 奇异值约束
         try:
+            trial_selection = current_selection + [candidate_idx]
+            trial_selection_np = np.array(trial_selection, dtype=np.int64)
             A_trial = self._build_matrix_numba(all_softmax_data, trial_selection_np)
             singular_values = np.linalg.svd(A_trial, compute_uv=False)
             
             if singular_values[-1] < 1e-10:
-                return False, -float('inf')
-            
+                return False, -float('inf'), "singular_matrix"
             sigma_min = singular_values[-1]
             sigma_max = singular_values[0]
             diversity_score = sigma_min - self.lambda_param * (sigma_max / sigma_min - 1)
             
         except np.linalg.LinAlgError:
-            return False, -float('inf')
-        
-        # 4. 动态调整的正确率约束
+            return False, -float('inf'), "svd_error"
+        # 4. 正确率约束
         if label_filter is not None:
             M = all_softmax_data.shape[0]
             pred_labels = np.argmax(all_softmax_data[:, trial_selection, :4], axis=2)
@@ -197,9 +220,7 @@ class SampleSelector:
             all_incorrect_samples = np.all(~is_correct, axis=0)
             
             if np.any(all_correct_samples) or np.any(all_incorrect_samples):
-                return False, -float('inf')
-            
-            # 计算各模型的正确率
+                return False, -float('inf'), "all_correct_or_all_wrong"
             model_accuracies = np.mean(is_correct, axis=1)
             
             # 根据当前样本数量动态调整约束严格程度
@@ -212,10 +233,10 @@ class SampleSelector:
                     dynamic_tolerance = 0.6  # 80%的容忍度
                 elif num_samples <= 6:
                     # 早期阶段：较宽松
-                    dynamic_tolerance = 0.3  # 50%的容忍度
+                    dynamic_tolerance = 0.4  # 50%的容忍度
                 elif num_samples <= 10:
                     # 中期阶段：逐渐严格
-                    dynamic_tolerance = 0.2  # 30%的容忍度
+                    dynamic_tolerance = 0.3  # 30%的容忍度
                 else:
                     # 后期阶段：严格约束
                     dynamic_tolerance = self.accuracy_tolerance  # 使用设定值
@@ -235,9 +256,7 @@ class SampleSelector:
                     if num_samples <= 5:
                         diversity_score -= accuracy_std * 2  # 惩罚但不拒绝
                     else:
-                        return False, -float('inf')  # 后期直接拒绝
-                
-                # 奖励好的平衡（使用动态容忍度）
+                        return False, -float('inf'), "accuracy_constraint"
                 if dynamic_tolerance > 0:
                     balance_score = 1.0 - accuracy_std / dynamic_tolerance
                     diversity_score += balance_score * 0.5  # 降低奖励权重
@@ -248,14 +267,15 @@ class SampleSelector:
                     diversity_score -= accuracy_std * 4
         
         # 5. 增强方法平衡约束（提高优先级，更严格）
+        AUG_BALANCE_TOLERANCE = 5   
         candidate_augmentation = sample_info[candidate_idx]['augmentation_method']
         if candidate_augmentation in current_augmentation_counts:
             aug_count = current_augmentation_counts[candidate_augmentation] + 1
             target_aug_count = target_augmentation_counts.get(candidate_augmentation, 0)
             
             # 更严格的平衡约束
-            if aug_count > target_aug_count + 1:  # 只允许+1的偏差
-                diversity_score -= 2.0  # 增加惩罚力度
+            if aug_count > target_aug_count + AUG_BALANCE_TOLERANCE:  
+                diversity_score -= 1.0  # 增加惩罚力度
             elif aug_count > target_aug_count:
                 diversity_score -= 0.5  # 轻微惩罚
             else:
@@ -269,10 +289,10 @@ class SampleSelector:
             target_count = target_difficulty_counts.get(candidate_difficulty, 0)
             
             # 如果超出目标太多，给予轻微惩罚
-            if new_count > target_count + 2:
+            if new_count > target_count + 5:  # 允许一定的偏差
                 diversity_score -= 1.0  # 降低惩罚力度
         
-        return True, diversity_score
+        return True, diversity_score, ""
     
     def select_diverse_samples(self,
                               model_paths: List[List[str]],
@@ -376,21 +396,24 @@ class SampleSelector:
                 
                 if augmentation_needs:
                     # 优先选择最需要的增强方法
-                    most_needed_augs = [aug for aug, _ in augmentation_needs[:2]]  # 选择最需要的2种
+                    most_needed_augs = [aug for aug, _ in augmentation_needs[:2]]  # 选择最需要的3种
                     
                     preferred_candidates = []
+                    other_candidates = []
                     for idx in remaining_indices:
                         idx_augmentation = sample_info[idx]['augmentation_method']
                         if idx_augmentation in most_needed_augs:
                             preferred_candidates.append(idx)
-                    
+                        else:
+                            other_candidates.append(idx)
+                    # 优先最需要的增强方法，其余增强方法放在末尾
+                    candidate_pool = preferred_candidates + other_candidates
                     if preferred_candidates:
-                        candidate_pool = preferred_candidates
                         print(f"\n第{iteration+1}轮: 优先选择增强方法 {most_needed_augs}")
             
             # 在候选池中寻找最佳样本
             for candidate_idx in candidate_pool:
-                is_valid, score = self._check_all_constraints(
+                is_valid, score, exit_reason = self._check_all_constraints(
                     candidate_idx, selected_indices, all_softmax_data,
                     all_difficulties, sample_info, label_filter,
                     target_difficulty_counts, current_difficulty_counts,
@@ -469,27 +492,36 @@ class SampleSelector:
         """收集选中样本的详细信息"""
         if not selected_indices:
             return pd.DataFrame()
-        
         info_cols = ['camera_uuid', 'room', 'frame_num_a', 'frame_num_b', 'label', 'difficulty', 'augmentation_method']
+        # 合并额外字段
+        extra_cols = self.additional_info_fields if hasattr(self, 'additional_info_fields') else []
         selected_samples_info = []
-        
         for i, idx in enumerate(selected_indices):
             sample_data = base_df.iloc[idx][info_cols].to_dict()
+            # 合并额外字段
+            if extra_cols:
+                key = (str(sample_data['camera_uuid']), str(sample_data['room']), int(sample_data['frame_num_a']), int(sample_data['frame_num_b']))
+                if hasattr(self, 'additional_info_dict') and self.additional_info_dict and key in self.additional_info_dict:
+                    for f in extra_cols:
+                        sample_data[f] = self.additional_info_dict[key][f]
             sample_data['original_index'] = idx
             sample_data['selection_order'] = i + 1
             selected_samples_info.append(sample_data)
-        
         df = pd.DataFrame(selected_samples_info)
-        
         # 添加方向标签
         direction_map = {0: 'Up', 1: 'Down', 2: 'Left', 3: 'Right', 4: 'Unknown'}
         df['b2a_direction'] = df['label'].map(direction_map)
-        
         # 调整列顺序
         cols_order = ['selection_order', 'original_index', 'camera_uuid', 'room', 
                      'frame_num_a', 'frame_num_b', 'b2a_direction', 'difficulty', 'augmentation_method']
-        df = df[cols_order]
-        
+        # 插入额外字段到合适位置
+        if extra_cols:
+            # 放在frame_num_b后
+            insert_pos = cols_order.index('frame_num_b') + 1
+            for f in extra_cols:
+                cols_order.insert(insert_pos, f)
+                insert_pos += 1
+        df = df[[c for c in cols_order if c in df.columns]]
         return df
     
     def _print_statistics(self, selected_indices: List[int], all_difficulties: np.ndarray, final_matrix: np.ndarray, sample_info: Dict):
@@ -519,7 +551,6 @@ class SampleSelector:
 
 
 def main():
-
     # 定义模型路径：二维列表，第一维是模型，第二维是该模型下不同增强方法的CSV
     model_paths = [
         # RCF模型下的不同增强方法
@@ -559,20 +590,23 @@ def main():
     balance_difficulty = True
     balance_augmentation = True
     
+    # 可选：额外csv路径
+    additional_csv_path = '/data2/zyz/S3DIS/ImagePairsFromPano/5classes_dataset/test_No_Unkown_and_<3.csv'
     # 创建更严格的样本选择器
     selector = SampleSelector(
         lambda_param=lambda_param,
         strict_accuracy=True,  # 启用严格模式
-        accuracy_tolerance=0.1  # 更严格的容忍度
+        accuracy_tolerance=0.12,  # 更严格的容忍度
+        additional_csv_path=additional_csv_path
     )
     
     # 输出路径设置
-    output_path = 'ImagePairsFromPano/5classes_dataset/diverse_sample_Enhance'
+    output_path = 'ImagePairsFromPano/5classes_dataset/diverse_sample_Enhance_>3'
     os.makedirs(output_path, exist_ok=True)
     
     try:
         # 创建样本选择器并运行
-        selector = SampleSelector(lambda_param=lambda_param)
+        # selector = SampleSelector(lambda_param=lambda_param)  # 已上移
         selected_indices, final_matrix, selected_samples_df = selector.select_diverse_samples(
             model_paths, N, label_filter, balance_difficulty, balance_augmentation
         )
